@@ -23,6 +23,7 @@ type Worker struct {
 	key          string
 	limiter      chan struct{}
 	handler      Handler
+	batchHandler func() Handler
 	onError      ErrorHandler
 	onBatchStart func()
 	logger       *slog.Logger
@@ -38,15 +39,16 @@ type Worker struct {
 // Config holds worker configuration.
 type Config struct {
 	Store        store.Store
-	Key          string        // Sorted set key to consume from
-	Limiter      chan struct{} // Controls concurrency - required
-	Handler      Handler       // Called for each item
-	OnError      ErrorHandler  // Called on handler error (optional)
-	OnBatchStart func()        // Called when a new batch is fetched (optional)
-	Logger       *slog.Logger  // Logger (optional)
-	PageSize     uint32        // Items to fetch per batch (default: 100)
-	PollDelay    time.Duration // Delay when queue is empty (default: 1s)
-	StatusDelay  time.Duration // Status log interval (default: 15s)
+	Key          string         // Sorted set key to consume from
+	Limiter      chan struct{}  // Controls concurrency - required
+	Handler      Handler        // Called for each item
+	BatchHandler func() Handler // Creates a handler owned by each fetched batch (optional)
+	OnError      ErrorHandler   // Called on handler error (optional)
+	OnBatchStart func()         // Called when a new batch is fetched (optional)
+	Logger       *slog.Logger   // Logger (optional)
+	PageSize     uint32         // Items to fetch per batch (default: 100)
+	PollDelay    time.Duration  // Delay when queue is empty (default: 1s)
+	StatusDelay  time.Duration  // Status log interval (default: 15s)
 }
 
 // New creates a new Worker.
@@ -74,6 +76,7 @@ func New(cfg *Config) *Worker {
 		key:          cfg.Key,
 		limiter:      cfg.Limiter,
 		handler:      cfg.Handler,
+		batchHandler: cfg.BatchHandler,
 		onError:      cfg.OnError,
 		onBatchStart: cfg.OnBatchStart,
 		logger:       logger,
@@ -101,6 +104,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	statusTime := time.Now()
 	var lastScore float64
 	var pending []store.ScoredMember
+	pendingHandler := w.handler
 
 	for {
 		select {
@@ -162,6 +166,9 @@ func (w *Worker) Start(ctx context.Context) error {
 				if w.onBatchStart != nil {
 					w.onBatchStart()
 				}
+				if w.batchHandler != nil {
+					pendingHandler = w.batchHandler()
+				}
 				pending = items
 			}
 
@@ -182,7 +189,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.limiter <- struct{}{}
 			w.wg.Add(1)
 
-			go func(id string, score float64) {
+			go func(id string, score float64, handler Handler) {
 				defer func() {
 					if r := recover(); r != nil {
 						w.logger.Error("worker panic",
@@ -197,7 +204,7 @@ func (w *Worker) Start(ctx context.Context) error {
 					done <- id
 				}()
 
-				if err := w.handler(ctx, id, score); err != nil {
+				if err := handler(ctx, id, score); err != nil {
 					// Re-score 30s in the future so other items process immediately
 					retryScore := float64(time.Now().Add(30*time.Second).UnixNano()) / 1e9
 					if rerr := w.store.ZAdd(ctx, []byte(w.key), store.ScoredMember{
@@ -213,7 +220,7 @@ func (w *Worker) Start(ctx context.Context) error {
 				if err := w.store.ZRem(ctx, []byte(w.key), []byte(id)); err != nil {
 					w.logger.Error("failed to remove from queue", "key", w.key, "id", id, "error", err)
 				}
-			}(id, item.Score)
+			}(id, item.Score, pendingHandler)
 		}
 	}
 }
@@ -251,6 +258,10 @@ func (w *Worker) ProcessOnce(ctx context.Context) error {
 		if len(items) == 0 {
 			break
 		}
+		handler := w.handler
+		if w.batchHandler != nil {
+			handler = w.batchHandler()
+		}
 
 		for _, item := range items {
 			id := string(item.Member)
@@ -259,18 +270,18 @@ func (w *Worker) ProcessOnce(ctx context.Context) error {
 			w.limiter <- struct{}{}
 			wg.Add(1)
 
-			go func(id string, score float64) {
+			go func(id string, score float64, handler Handler) {
 				defer func() {
 					<-w.limiter
 					wg.Done()
 				}()
 
-				if err := w.handler(ctx, id, score); err != nil {
+				if err := handler(ctx, id, score); err != nil {
 					if w.onError != nil {
 						w.onError(ctx, id, score, err)
 					}
 				}
-			}(id, score)
+			}(id, score, handler)
 		}
 	}
 

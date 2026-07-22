@@ -78,7 +78,6 @@ type OverlaySync struct {
 	logger      *slog.Logger
 	worker      *worker.Worker
 	gasp        *gasp.GASP // shared GASP instance for dependency resolution
-	directSeen  sync.Map   // txid dedup for processDirect within a batch
 }
 
 // NewOverlaySync creates a new overlay sync worker.
@@ -119,31 +118,34 @@ func (s *OverlaySync) Start(ctx context.Context) error {
 	if limiter == nil {
 		limiter = make(chan struct{}, s.config.Concurrency)
 	}
-	handler := s.process
-	if s.config.OnProcessed != nil {
-		inner := handler
-		handler = func(ctx context.Context, member string, score float64) error {
-			if err := inner(ctx, member, score); err != nil {
-				return err
-			}
-			return s.config.OnProcessed(s.topicName)
+	batchHandler := func() worker.Handler {
+		directSeen := &sync.Map{}
+		handler := func(ctx context.Context, member string, score float64) error {
+			return s.process(ctx, member, score, directSeen)
 		}
+		if s.config.OnProcessed != nil {
+			inner := handler
+			handler = func(ctx context.Context, member string, score float64) error {
+				if err := inner(ctx, member, score); err != nil {
+					return err
+				}
+				return s.config.OnProcessed(s.topicName)
+			}
+		}
+		return handler
 	}
 
 	s.worker = worker.New(&worker.Config{
-		Store:   s.store,
-		Key:     jbsync.QueueKey(s.config.QueueName),
-		Limiter: limiter,
-		Handler: handler,
+		Store:        s.store,
+		Key:          jbsync.QueueKey(s.config.QueueName),
+		Limiter:      limiter,
+		BatchHandler: batchHandler,
 		OnError: func(ctx context.Context, id string, score float64, err error) {
 			s.logger.Error("overlay sync error", "member", id, "score", score, "error", err)
 		},
 		PageSize:  s.config.PageSize,
 		PollDelay: s.config.PollDelay,
 		Logger:    s.logger,
-		OnBatchStart: func() {
-			s.directSeen = sync.Map{}
-		},
 	})
 
 	if s.config.ResolveDependencies {
@@ -200,44 +202,49 @@ func parseQueueMember(member string) (txid *chainhash.Hash, outpoint *transactio
 }
 
 // process handles a single item from the queue.
-func (s *OverlaySync) process(ctx context.Context, member string, score float64) error {
+func (s *OverlaySync) process(ctx context.Context, member string, score float64, directSeen *sync.Map) error {
 	txid, outpoint, err := parseQueueMember(member)
 	if err != nil {
 		return err
 	}
 
 	if !s.config.ResolveDependencies || outpoint == nil {
-		return s.processDirect(ctx, txid)
+		return s.processDirect(ctx, txid, directSeen)
 	}
 	return s.processOutpoint(ctx, s.gasp, outpoint, &sync.Map{})
+}
+
+func processDirectOnce(directSeen *sync.Map, txid *chainhash.Hash, submit func() error) error {
+	if _, loaded := directSeen.LoadOrStore(*txid, struct{}{}); loaded {
+		return nil
+	}
+	return submit()
 }
 
 // processDirect submits a transaction directly without dependency resolution.
 // Deduplicates by txid within the current batch to avoid redundant submissions
 // when multiple outpoints from the same transaction are queued.
-func (s *OverlaySync) processDirect(ctx context.Context, txid *chainhash.Hash) error {
-	if _, loaded := s.directSeen.LoadOrStore(*txid, struct{}{}); loaded {
-		return nil
-	}
-
-	beefBytes, err := s.beefStorage.BuildFullBeef(ctx, txid)
-	if err != nil {
-		return fmt.Errorf("failed to build BEEF for %s: %w", txid.String(), err)
-	}
-
-	if _, err := s.engine.Submit(ctx, sdkoverlay.TaggedBEEF{
-		Beef:   beefBytes,
-		Topics: []string{s.topicName},
-	}, engine.SubmitModeHistorical, nil); err != nil {
-		if s.config.ErrorClassifier != nil && s.config.ErrorClassifier(err) == ErrorSkip {
-			s.logger.Warn("skipping transaction due to classified error",
-				"txid", txid.String(), "error", err)
-			return nil
+func (s *OverlaySync) processDirect(ctx context.Context, txid *chainhash.Hash, directSeen *sync.Map) error {
+	return processDirectOnce(directSeen, txid, func() error {
+		beefBytes, err := s.beefStorage.BuildFullBeef(ctx, txid)
+		if err != nil {
+			return fmt.Errorf("failed to build BEEF for %s: %w", txid.String(), err)
 		}
-		return fmt.Errorf("failed to submit %s to %s: %w", txid.String(), s.topicName, err)
-	}
 
-	return nil
+		if _, err := s.engine.Submit(ctx, sdkoverlay.TaggedBEEF{
+			Beef:   beefBytes,
+			Topics: []string{s.topicName},
+		}, engine.SubmitModeHistorical, nil); err != nil {
+			if s.config.ErrorClassifier != nil && s.config.ErrorClassifier(err) == ErrorSkip {
+				s.logger.Warn("skipping transaction due to classified error",
+					"txid", txid.String(), "error", err)
+				return nil
+			}
+			return fmt.Errorf("failed to submit %s to %s: %w", txid.String(), s.topicName, err)
+		}
+
+		return nil
+	})
 }
 
 // processWithGASP uses GASP to resolve input dependencies before submitting
