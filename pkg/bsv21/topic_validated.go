@@ -3,6 +3,7 @@ package bsv21
 import (
 	"context"
 	"log/slog"
+	"math/bits"
 	"slices"
 
 	overlayerr "github.com/b-open-io/1sat-stack/pkg/overlay"
@@ -13,6 +14,12 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 )
 
+// TxLoader loads a transaction by txid. Used to inspect the scripts of inputs
+// that are not present in a submitted BEEF.
+type TxLoader interface {
+	LoadTx(ctx context.Context, txid *chainhash.Hash) (*transaction.Transaction, error)
+}
+
 // Bsv21ValidatedTopicManager implements the overlay TopicManager interface for BSV21.
 // It validates token transfers by checking input/output balances.
 // This matches the implementation in bsv21-overlay/topics/bsv21-topic-validated.go
@@ -20,13 +27,17 @@ type Bsv21ValidatedTopicManager struct {
 	topic    string
 	tokenIds map[string]struct{}
 	metadata *overlay.MetaData
+	txLoader TxLoader
 }
 
-// NewBsv21ValidatedTopicManager creates a new BSV21 validated topic manager
-func NewBsv21ValidatedTopicManager(topic string, tokenIds []string, metadata *overlay.MetaData) *Bsv21ValidatedTopicManager {
+// NewBsv21ValidatedTopicManager creates a new BSV21 validated topic manager.
+// txLoader is optional: when set, IdentifyNeededInputs uses it to look at the
+// scripts of unknown inputs and request only actual token inputs.
+func NewBsv21ValidatedTopicManager(topic string, tokenIds []string, metadata *overlay.MetaData, txLoader TxLoader) *Bsv21ValidatedTopicManager {
 	tm := &Bsv21ValidatedTopicManager{
 		topic:    topic,
 		metadata: metadata,
+		txLoader: txLoader,
 	}
 	if len(tokenIds) > 0 {
 		tm.tokenIds = make(map[string]struct{}, len(tokenIds))
@@ -70,6 +81,21 @@ type tokenSummary struct {
 	// Op=deploy+auth) for this tokenId. Confers unlimited mint authority for
 	// the tx's mint and auth outputs.
 	hasAuthInput bool
+	// True when any uint64 amount accumulator would have wrapped. A wrapped
+	// sum can make an inflated output total look covered by the inputs, so
+	// transfer/burn outputs are never admitted for an overflowed summary.
+	overflow bool
+}
+
+// add accumulates amt into acc, flagging the summary when the sum would
+// exceed math.MaxUint64 instead of silently wrapping.
+func (ts *tokenSummary) add(acc *uint64, amt uint64) {
+	sum, carry := bits.Add64(*acc, amt, 0)
+	if carry != 0 {
+		ts.overflow = true
+		return
+	}
+	*acc = sum
 }
 
 // IdentifyAdmissibleOutputs determines which outputs should be admitted to
@@ -126,11 +152,11 @@ func (tm *Bsv21ValidatedTopicManager) IdentifyAdmissibleOutputs(ctx context.Cont
 			admit.OutputsToAdmit = append(admit.OutputsToAdmit, uint32(vout))
 		case string(bsv21template.OpTransfer):
 			ts := getSummary(b.Id)
-			ts.transferOut += b.Amt
+			ts.add(&ts.transferOut, b.Amt)
 			ts.transferVouts = append(ts.transferVouts, uint32(vout))
 		case string(bsv21template.OpBurn):
 			ts := getSummary(b.Id)
-			ts.burnOut += b.Amt
+			ts.add(&ts.burnOut, b.Amt)
 			ts.burnVouts = append(ts.burnVouts, uint32(vout))
 		case string(bsv21template.OpMint):
 			ts := getSummary(b.Id)
@@ -216,7 +242,7 @@ func (tm *Bsv21ValidatedTopicManager) IdentifyAdmissibleOutputs(ctx context.Cont
 				"source_txid", txin.SourceTXID.String(),
 				"amt", b.Amt)
 			admit.CoinsToRetain = append(admit.CoinsToRetain, uint32(vin))
-			ts.tokensIn += b.Amt
+			ts.add(&ts.tokensIn, b.Amt)
 		}
 	}
 
@@ -224,7 +250,8 @@ func (tm *Bsv21ValidatedTopicManager) IdentifyAdmissibleOutputs(ctx context.Cont
 	// mint/auth admit on auth-input presence. The two layers are independent:
 	// a tx with insufficient balance can still admit valid mint outputs.
 	for _, ts := range summary {
-		if ts.tokensIn >= ts.transferOut+ts.burnOut {
+		out, carry := bits.Add64(ts.transferOut, ts.burnOut, 0)
+		if !ts.overflow && carry == 0 && ts.tokensIn >= out {
 			admit.OutputsToAdmit = append(admit.OutputsToAdmit, ts.transferVouts...)
 			admit.OutputsToAdmit = append(admit.OutputsToAdmit, ts.burnVouts...)
 		}
@@ -245,7 +272,12 @@ func (tm *Bsv21ValidatedTopicManager) IdentifyAdmissibleOutputs(ctx context.Cont
 	return admit, nil
 }
 
-// IdentifyNeededInputs returns the inputs needed for processing
+// IdentifyNeededInputs returns the inputs required to validate this
+// transaction's token operations: inputs whose source output carries a token
+// id this transaction also has outputs for. Inputs already present in the
+// BEEF are skipped. For the rest, the source transaction's script decides
+// when it is available locally; when it is not, the input is requested so the
+// remote can resolve or reject it.
 func (tm *Bsv21ValidatedTopicManager) IdentifyNeededInputs(ctx context.Context, beef *transaction.Beef, txid *chainhash.Hash) ([]*transaction.Outpoint, error) {
 	tx := beef.FindTransactionForSigningByHash(txid)
 	if tx == nil {
@@ -254,12 +286,19 @@ func (tm *Bsv21ValidatedTopicManager) IdentifyNeededInputs(ctx context.Context, 
 
 	tokens := make(map[string]struct{})
 	for _, output := range tx.Outputs {
-		if b := bsv21template.Decode(output.LockingScript); b != nil {
-			if !tm.HasTokenId(b.Id) {
-				continue
-			}
-			tokens[b.Id] = struct{}{}
+		b := bsv21template.Decode(output.LockingScript)
+		if b == nil {
+			continue
 		}
+		// Deploy outputs admit unconditionally and never reference existing
+		// token inputs, so they create no input requirements.
+		if b.Op == string(bsv21template.OpDeployMint) || b.Op == string(bsv21template.OpDeployAuth) {
+			continue
+		}
+		if !tm.HasTokenId(b.Id) {
+			continue
+		}
+		tokens[b.Id] = struct{}{}
 	}
 
 	if len(tokens) == 0 {
@@ -268,12 +307,32 @@ func (tm *Bsv21ValidatedTopicManager) IdentifyNeededInputs(ctx context.Context, 
 
 	var inputs []*transaction.Outpoint
 	for _, txin := range tx.Inputs {
-		if txin.SourceTransaction == nil {
-			inputs = append(inputs, &transaction.Outpoint{
-				Txid:  *txin.SourceTXID,
-				Index: txin.SourceTxOutIndex,
-			})
+		if txin.SourceTransaction != nil {
+			continue
 		}
+		outpoint := &transaction.Outpoint{
+			Txid:  *txin.SourceTXID,
+			Index: txin.SourceTxOutIndex,
+		}
+		if tm.txLoader != nil {
+			if parent, err := tm.txLoader.LoadTx(ctx, txin.SourceTXID); err == nil && parent != nil {
+				if int(txin.SourceTxOutIndex) >= len(parent.Outputs) {
+					continue
+				}
+				b := bsv21template.Decode(parent.Outputs[txin.SourceTxOutIndex].LockingScript)
+				if b == nil {
+					continue
+				}
+				if b.Op == string(bsv21template.OpDeployMint) || b.Op == string(bsv21template.OpDeployAuth) {
+					b.Id = outpoint.OrdinalString()
+				}
+				if _, ok := tokens[b.Id]; ok {
+					inputs = append(inputs, outpoint)
+				}
+				continue
+			}
+		}
+		inputs = append(inputs, outpoint)
 	}
 	return inputs, nil
 }

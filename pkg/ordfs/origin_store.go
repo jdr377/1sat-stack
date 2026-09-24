@@ -11,17 +11,50 @@ import (
 )
 
 var (
-	prefixOrg = []byte("org:")
-	prefixSeq = []byte("seq:")
-	prefixRev = []byte("rev:")
-	prefixMap = []byte("map:")
-	prefixPar = []byte("par:")
+	prefixOrg  = []byte("org:")
+	prefixSeq  = []byte("seq:")
+	prefixRev  = []byte("rev:")
+	prefixMap  = []byte("map:")
+	prefixPar  = []byte("par:")
+	metaSchema = []byte("meta:schema")
 )
 
-const outpointSize = 36
+const (
+	outpointSize = 36
+	orgValueSize = outpointSize + 4 // origin + seq
+
+	// originStoreSchemaVersion is the Badger layout version.
+	// v0: org: → origin only (36B). v1: org: → origin||seq (40B).
+	// Bump and add a step in ensureSchema when the on-disk layout changes again.
+	originStoreSchemaVersion uint32 = 1
+)
 
 type BadgerOriginStore struct {
 	db *badger.DB
+}
+
+func orgKey(outpoint *transaction.Outpoint) []byte {
+	key := make([]byte, len(prefixOrg)+outpointSize)
+	copy(key, prefixOrg)
+	copy(key[len(prefixOrg):], outpoint.Bytes())
+	return key
+}
+
+func encodeOrgValue(origin *transaction.Outpoint, seq uint32) []byte {
+	val := make([]byte, orgValueSize)
+	copy(val, origin.Bytes())
+	binary.BigEndian.PutUint32(val[outpointSize:], seq)
+	return val
+}
+
+func decodeOrgValue(val []byte) *OriginInfo {
+	if len(val) < orgValueSize {
+		return nil
+	}
+	return &OriginInfo{
+		Origin: transaction.NewOutpointFromBytes(val[:outpointSize]),
+		Seq:    binary.BigEndian.Uint32(val[outpointSize:]),
+	}
 }
 
 func NewBadgerOriginStore(path string) (*BadgerOriginStore, error) {
@@ -31,7 +64,60 @@ func NewBadgerOriginStore(path string) (*BadgerOriginStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open origin store: %w", err)
 	}
-	return &BadgerOriginStore{db: db}, nil
+	s := &BadgerOriginStore{db: db}
+	if err := s.ensureSchema(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("origin store schema: %w", err)
+	}
+	return s, nil
+}
+
+func (s *BadgerOriginStore) schemaVersion() (uint32, error) {
+	var ver uint32
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(metaSchema)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			if len(val) < 4 {
+				return fmt.Errorf("invalid meta:schema value length %d", len(val))
+			}
+			ver = binary.BigEndian.Uint32(val)
+			return nil
+		})
+	})
+	return ver, err
+}
+
+func (s *BadgerOriginStore) setSchemaVersion(ver uint32) error {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, ver)
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(metaSchema, buf)
+	})
+}
+
+// ensureSchema stamps meta:schema for future layout migrations.
+// v0→v1 (org: origin-only → origin||seq) is wipe-and-recrawl, not an automatic rebuild.
+func (s *BadgerOriginStore) ensureSchema() error {
+	ver, err := s.schemaVersion()
+	if err != nil {
+		return err
+	}
+	if ver < originStoreSchemaVersion {
+		if err := s.setSchemaVersion(originStoreSchemaVersion); err != nil {
+			return err
+		}
+		ver = originStoreSchemaVersion
+	}
+	if ver > originStoreSchemaVersion {
+		return fmt.Errorf("origin store schema v%d newer than supported v%d", ver, originStoreSchemaVersion)
+	}
+	return nil
 }
 
 func seqKey(prefix []byte, origin *transaction.Outpoint, seq uint32) []byte {
@@ -74,19 +160,18 @@ func originPrefix(prefix []byte, origin *transaction.Outpoint) []byte {
 	return key
 }
 
-func (s *BadgerOriginStore) GetOrigin(_ context.Context, outpoint *transaction.Outpoint) (*transaction.Outpoint, error) {
-	var result *transaction.Outpoint
+func (s *BadgerOriginStore) GetOrigin(_ context.Context, outpoint *transaction.Outpoint) (*OriginInfo, error) {
+	var result *OriginInfo
 	err := s.db.View(func(txn *badger.Txn) error {
-		key := make([]byte, len(prefixOrg)+outpointSize)
-		copy(key, prefixOrg)
-		copy(key[len(prefixOrg):], outpoint.Bytes())
-
-		item, err := txn.Get(key)
+		item, err := txn.Get(orgKey(outpoint))
 		if err != nil {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			result = transaction.NewOutpointFromBytes(val)
+			result = decodeOrgValue(val)
+			if result == nil {
+				return fmt.Errorf("invalid org value length %d", len(val))
+			}
 			return nil
 		})
 	})
@@ -170,7 +255,7 @@ func (s *BadgerOriginStore) getLatestBefore(prefix []byte, origin *transaction.O
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		it.Seek(seqKey(prefix, origin, seq+1))
+		it.Seek(seqKey(prefix, origin, seq))
 
 		pfx := originPrefix(prefix, origin)
 		if !it.ValidForPrefix(pfx) {
@@ -200,7 +285,7 @@ func (s *BadgerOriginStore) GetLatestRevBefore(_ context.Context, origin *transa
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		it.Seek(seqKey(prefixRev, origin, seq+1))
+		it.Seek(seqKey(prefixRev, origin, seq))
 
 		pfx := originPrefix(prefixRev, origin)
 		if !it.ValidForPrefix(pfx) {
@@ -303,20 +388,12 @@ func (s *BadgerOriginStore) WriteBatch(_ context.Context, batch *OriginBatch) er
 	wb := s.db.NewWriteBatch()
 	defer wb.Cancel()
 
-	originBytes := batch.Origin.Bytes()
-
-	for _, op := range batch.Origins {
-		key := make([]byte, len(prefixOrg)+outpointSize)
-		copy(key, prefixOrg)
-		copy(key[len(prefixOrg):], op.Bytes())
-		if err := wb.Set(key, originBytes); err != nil {
-			return fmt.Errorf("failed to write origin mapping: %w", err)
-		}
-	}
-
 	for _, entry := range batch.Entries {
 		opBytes := entry.Outpoint.Bytes()
 
+		if err := wb.Set(orgKey(entry.Outpoint), encodeOrgValue(batch.Origin, entry.Seq)); err != nil {
+			return fmt.Errorf("failed to write origin mapping: %w", err)
+		}
 		if err := wb.Set(seqKey(prefixSeq, batch.Origin, entry.Seq), opBytes); err != nil {
 			return fmt.Errorf("failed to write seq entry: %w", err)
 		}
@@ -344,15 +421,10 @@ func (s *BadgerOriginStore) WriteBatch(_ context.Context, batch *OriginBatch) er
 func (s *BadgerOriginStore) AddEntry(_ context.Context, origin *transaction.Outpoint, entry *OriginEntry) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		opBytes := entry.Outpoint.Bytes()
-		originBytes := origin.Bytes()
 
-		orgKey := make([]byte, len(prefixOrg)+outpointSize)
-		copy(orgKey, prefixOrg)
-		copy(orgKey[len(prefixOrg):], opBytes)
-		if err := txn.Set(orgKey, originBytes); err != nil {
+		if err := txn.Set(orgKey(entry.Outpoint), encodeOrgValue(origin, entry.Seq)); err != nil {
 			return err
 		}
-
 		if err := txn.Set(seqKey(prefixSeq, origin, entry.Seq), opBytes); err != nil {
 			return err
 		}

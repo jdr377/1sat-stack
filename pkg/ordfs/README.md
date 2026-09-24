@@ -17,27 +17,32 @@ If both are present, the inscription content type takes precedence, but B protoc
 
 ### Sequence Model
 
-The `seq` parameter controls how OrdFS resolves content along the ordinal transfer chain. This is the most important concept in OrdFS.
+Sequence numbers are **absolute ranks from the origin** of the ordinal chain (`0` = origin inscription, then one hop per transfer). The path outpoint selects which chain; `:seq` selects the rank on that chain.
 
-| seq value | Behavior |
-|-----------|----------|
-| **nil** (omitted) | Return raw content from the exact outpoint. No origin resolution, no crawl. |
-| **-2** | Origin only. Backward crawl to find the origin outpoint, return its content directly. No forward crawl. |
-| **0** | Resolve content at the requested outpoint. Also resolve origin to populate metadata headers. |
-| **-1** | Latest. Full forward crawl to the tip of the transfer chain. |
-| **N** (positive int) | Resolve to a specific absolute sequence number in the transfer chain. |
+1-sat outputs are **chain-resolved by default**. Non-1-sat outputs are always parsed as the exact outpoint.
+
+| Path / flag | Behavior |
+|-------------|----------|
+| **no `:seq`** | Resolve at this outpoint’s own absolute rank (lookup/crawl origin, then rev/map/parent ≤ that rank). |
+| **`:0`** | Absolute origin (rank 0). |
+| **`:N`** (N > 0) | Absolute rank N from origin. |
+| **`:-1`** | Tip of the transfer chain. |
+| **`:-2`** | Alias for `:0` (legacy). |
+| **`?raw`** | Skip ordinal resolution (and directory defaults). Return this outpoint’s script bytes only. |
 
 The seq is appended to the path with a colon: `/content/{txid_vout}:{seq}`.
 
 ### Sequence vs Content Revision
 
-These are tracked separately in Redis sorted sets keyed by origin:
+Tracked in the origin store (Badger or Redis), keyed by origin:
 
-- **`seq:{origin}`** -- Every spend in the transfer chain, regardless of whether the output has content. This is the complete ownership history.
-- **`rev:{origin}`** -- Only entries where the output contains content (inscription or B protocol). This tracks content revisions.
-- **`map:{origin}`** -- Only entries where the output has MAP data.
+- **`seq`** -- Every hop in the transfer chain (ownership history).
+- **`rev`** -- Hops that carry content (inscription or B protocol).
+- **`map` / `par`** -- Hops with MAP or parent data.
 
-When you request seq=5, OrdFS looks up `rev:{origin}` for the most recent content entry at or before seq 5. This means a transfer (ownership change without reinscription) does not change the content -- you still get the last reinscribed content.
+When you request absolute seq=5, OrdFS uses the most recent **rev** at or before 5. A pure transfer does not change served content — you still get the last reinscription.
+
+`org:<outpoint>` stores `origin + seq` so the rank of any known outpoint is a single lookup.
 
 ### MAP Metadata Merging
 
@@ -47,7 +52,7 @@ Nested JSON fields `subTypeData` and `royalties` are parsed from their string re
 
 ### Directories
 
-An inscription with content type `ord-fs/json` is a directory. Its body is a JSON object mapping filenames to outpoint pointers:
+An inscription with content type `ord-fs/json` (legacy) or `ordfs/dir` (binary) is a directory. JSON bodies map filenames to outpoint pointers:
 
 ```json
 {
@@ -61,7 +66,22 @@ Directory behavior:
 - Empty path default: serve map key `"."` in place if present; else redirect to `index.html` if present
 - Path traversal resolves filenames against the directory mapping
 - SPA fallback: if the requested file isn't found, `index.html` is served instead (not `"."`)
-- Pass `?raw` to get the raw directory JSON instead of following the default
+- `?raw` skips interpretation: no ordinal resolve and no directory default — the outpoint’s bytes only (directory JSON/binary, or an `ordfs/patch` envelope)
+
+### Patches
+
+An inscription with content type `ordfs/patch` is a vcdiff (RFC 3284) against a base outpoint. HTTP serving applies the chain (max 8) and inherits the base content type. A patch of a directory can be path-walked. `Load()` returns the envelope unapplied.
+
+### BRC-150 provenance
+
+`GET /ordfs/brc150/{txid_vout}` returns **Outpoint BEEF (BRC-158)** for a 1-sat tip:
+
+1. Resolve ordinal path tip→origin (origin store / crawl)
+2. Merge each path hop from beef storage
+3. For every hop, merge source txs for inputs **0..carrier** only (carrier = spend of path parent, or origin funding input) so a verifier can re-run 1Sat assignment without pulling post-carrier noise inputs
+4. Serialize `0x16a7beef || tip_outpoint(36) || BEEF`
+
+Headers: `X-Origin` (proven origin), `X-Content-Type` (origin inscription MIME when known). No path header — tip is the request outpoint; body is Outpoint BEEF only (`application/octet-stream`).
 
 ### Streaming
 
@@ -86,51 +106,79 @@ HTML inscriptions can reference other inscriptions using relative paths. For exa
 ## Configuration
 
 ```yaml
+# Default: Badger origin store on local disk under {data_dir}/ordfs
 ordfs:
   enabled: true
-  redis:
-    url: "redis://localhost:6379/0"
+  cache:
+    lru_size: 10000
+    redis_url: "redis://localhost:6379/0"
+    redis_ttl: "24h"
   routes:
     enabled: true
     prefix: "/ordfs"
 ```
 
+```yaml
+# Stateless deployments: Redis origin store, no local volume
+ordfs:
+  enabled: true
+  origin_store_provider: "redis"
+  origin_store_redis_url: "redis://localhost:6379/1"
+```
+
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `false` | Enable the OrdFS service |
-| `redis.url` | `redis://localhost:6379/0` | Redis URL for ordinal chain caching |
+| `enabled` | `true` | Enable the OrdFS service |
+| `origin_store_provider` | `badger` | Origin store backend: `badger` or `redis`. |
+| `origin_store_path` | `{data_dir}/ordfs` | Badger data directory for the origin store (`badger` provider only). |
+| `origin_store_redis_url` | — | Redis URL for the origin store; required when the provider is `redis`, with no fallback to badger. |
+| `cache.lru_size` | `10000` | Max entries in the in-process parsed/merged cache |
+| `cache.redis_url` | — | Optional Redis tier behind the LRU cache |
+| `cache.redis_ttl` | — | TTL for Redis cache entries (e.g. `24h`); empty means no expiration |
 | `routes.enabled` | `true` | Enable HTTP route registration |
 | `routes.prefix` | `/ordfs` | Mount prefix for metadata/preview/stream routes |
+
+Badger is the default and keeps the origin index on local disk. Redis holds the
+same index in a shared server instead, which is what stateless deployments and
+horizontally scaled replicas need since they have no durable local volume.
+
+The Redis origin store writes keys with no TTL and requires a Redis configured
+as a durable store: persistence on, eviction off (`maxmemory-policy noeviction`).
+Do not point it at an instance tuned as a cache — evicted origin keys force full
+chain re-crawls. Co-hosting with the cache tier is safe (key namespaces do not
+collide) only when that instance meets the durability requirements.
 
 OrdFS depends on `beef` (transaction storage) and `spends` (spend tracking) being available.
 
 ## Examples
 
-### Get raw inscription content
+### Resolve at this outpoint (default)
 
-No sequence resolution -- returns exactly what's at the outpoint:
+Chain-resolve the outpoint’s own absolute rank (origin headers, last rev ≤ that rank):
 
 ```bash
 curl https://api.1sat.app/content/{txid}_{vout}
 ```
 
-### Get latest content
+### Raw outpoint bytes (no ordinal resolve)
 
-Forward crawl to the tip of the chain:
+```bash
+curl "https://api.1sat.app/content/{txid}_{vout}?raw"
+```
+
+### Latest content (tip)
 
 ```bash
 curl https://api.1sat.app/content/{txid}_{vout}:-1
 ```
 
-### Get origin content
-
-Backward crawl to find the origin, return its content:
+### Origin (absolute rank 0)
 
 ```bash
-curl https://api.1sat.app/content/{txid}_{vout}:-2
+curl https://api.1sat.app/content/{txid}_{vout}:0
 ```
 
-### Get content at a specific sequence
+### Specific absolute sequence
 
 ```bash
 curl https://api.1sat.app/content/{txid}_{vout}:5
@@ -200,7 +248,92 @@ All content responses include:
 ### Caching
 
 - **Specific sequence** (seq >= 0, seq == -2): `Cache-Control: public, max-age=31536000, immutable`
-- **Latest** (seq == -1): `Cache-Control: no-cache, no-store, must-revalidate`
+- **Latest** (seq == -1): `Cache-Control: no-store`
+
+## Image transforms
+
+Inscriptions are stored at their original size, commonly several megabytes for a
+single image, which makes a grid of them expensive to render. `/ordfs/image`
+returns a transformed copy (under the ordfs API prefix, not at app root — root
+`/content` stays reserved for the ordfs content protocol).
+
+**Concrete outpoint only.** This endpoint does not accept `:seq` or directory
+paths. Resolve ordinality via metadata or content first, then pass the outpoint
+that holds the inscription bytes.
+
+```bash
+curl "https://api.1sat.app/1sat/ordfs/image/{txid}_{vout}?w=384"
+curl "https://api.1sat.app/1sat/ordfs/image/{txid}_{vout}?w=256&h=256&fit=fill&g=north"
+```
+
+| Param | Default | Behavior |
+|-------|---------|----------|
+| `w`   | 384     | Target width. Snaps **up** to the nearest supported width. |
+| `h`   | —       | Target height. Snaps up the same way. |
+| `fit` | `limit` | How the source maps onto the box. See below. |
+| `g`   | `center`| Gravity for `fill` and `pad`. |
+| `f`   | `auto`  | `auto`, `jpeg`, `png`, `webp`, `avif`. |
+| `q`   | 75      | Quality 1-100. Rounded to the nearest 5. |
+
+### Fit modes
+
+The vocabulary follows Cloudinary's, which is the most widely understood in this
+space. The endpoint is named for the resource, not for one use case — resizing a
+hero image and cropping an avatar are the same operation with different modes.
+
+| Mode | Behavior |
+|------|----------|
+| `limit` | Fit inside the box, preserve aspect ratio, **never upscale**. The default. |
+| `fit` | Fit inside the box, preserve aspect ratio, upscale if the source is smaller. |
+| `fill` | Cover the box exactly, cropping the overflow at the gravity. |
+| `pad` | Fit inside the box and pad the remainder out to the exact size. |
+| `scale` | Stretch to the exact box, ignoring aspect ratio. |
+
+`fill`, `pad`, and `scale` need both `w` and `h` to mean anything; given only
+one, they degrade to `limit` rather than producing a surprising crop.
+
+Supported dimensions: 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640, 828,
+1080, 1200, 1920, 2560, 3840. Snapping bounds the CDN cache key space
+regardless of what clients request.
+
+### Format negotiation
+
+`f=auto` picks the smallest encoding the client accepts, preferring AVIF, then
+WebP, then PNG for transparent sources and JPEG otherwise. Negotiated responses
+carry `Vary: Accept`. Measured on a 2,596,285 byte PNG inscription at `w=384`:
+
+| Format | Bytes | % of source | Encode |
+|--------|-------|-------------|--------|
+| avif | 11,078 | 0.43% | 100ms |
+| webp | 16,972 | 0.65% | 62ms |
+| jpeg | 20,523 | 0.79% | 65ms |
+| png | 250,016 | 9.63% | 410ms |
+
+WebP and AVIF encode through WebAssembly, so no cgo is required. The runtimes
+cost roughly a second to compile on first use; `WarmImageEncoders` does that at
+startup so no request absorbs it.
+
+### Caching
+
+Derived bodies are **not** stored in the ordfs `parsed:`/`merged:` cache pool —
+that pool is for small structural metadata. Every successful response is
+content-addressed (concrete outpoint) and sent with:
+
+- `Cache-Control: public, max-age=31536000, immutable`
+- `Vary: Accept` when `f=auto` negotiated the format
+
+### Behavior notes
+
+- Path is a concrete outpoint (or bare txid). `:seq` and directory paths return
+  **400** — resolve via metadata/content first.
+- `image/jpeg`, `image/png`, `image/gif`, and `image/webp` are transformed.
+- `image/svg+xml` is passed through unchanged when `f` is omitted or `auto`
+  (it already scales). An explicit raster `f` (`png`, `jpeg`, `webp`, `avif`)
+  rasterizes it through resvg for consumers that cannot decode SVG, such as
+  satori OG image rendering.
+- Anything else returns **415**.
+- Type is checked before content bytes are loaded when the parse cache can
+  answer, so non-images are rejected without pulling a multi-megabyte payload.
 
 ## See Also
 

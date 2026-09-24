@@ -3,7 +3,6 @@ package ordfs
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -54,6 +53,12 @@ func (r *Routes) Register(router fiber.Router) {
 
 	// Stream endpoint
 	router.Get("/stream/:outpoint", r.HandleStream)
+
+	// BRC-150 provenance as Outpoint BEEF / BRC-158 (binary)
+	router.Get("/brc150/*", r.HandleBRC150)
+
+	// Image transforms (under /ordfs, not root — not part of the ordfs content protocol)
+	router.Get("/image/*", r.HandleImage)
 }
 
 // RegisterContent registers the wildcard content endpoint.
@@ -97,12 +102,14 @@ func (r *Routes) HandleContent(c *fiber.Ctx) error {
 		})
 	}
 
+	raw := c.Query("raw") != ""
 	// Build request
 	var req *Request
 	if isTxid {
 		req = &Request{
 			Txid:    &outpoint.Txid,
 			Seq:     pp.Seq,
+			Raw:     raw,
 			Content: true,
 			Map:     c.QueryBool("map", false),
 			Parent:  c.QueryBool("parent", false),
@@ -111,6 +118,7 @@ func (r *Routes) HandleContent(c *fiber.Ctx) error {
 		req = &Request{
 			Outpoint: outpoint,
 			Seq:      pp.Seq,
+			Raw:      raw,
 			Content:  true,
 			Map:      c.QueryBool("map", false),
 			Parent:   c.QueryBool("parent", false),
@@ -132,13 +140,57 @@ func (r *Routes) HandleContent(c *fiber.Ctx) error {
 		})
 	}
 
-	// Check if this is a directory (ord-fs/json)
-	if resp.ContentType == "ord-fs/json" {
-		return r.handleDirectory(c, resp, pp, req.Seq)
-	}
+	return r.serveResolved(c, resp, pp, req.Seq)
+}
 
-	// Not a directory - serve content directly
-	return r.sendContentResponse(c, resp, pp.Seq)
+func (r *Routes) serveResolved(c *fiber.Ctx, resp *Response, pp *pointerPath, seq *int) error {
+	raw := c.Query("raw") != ""
+	if isPatchType(resp.ContentType) && !(raw && pp.FilePath == "") {
+		resolved, err := r.applyPatchResponse(c, resp)
+		if err != nil {
+			return r.patchHTTPError(c, err)
+		}
+		resp = resolved
+	}
+	if isDirectoryType(resp.ContentType) {
+		return r.handleDirectory(c, resp, pp, seq)
+	}
+	return r.sendContentResponse(c, resp, seq)
+}
+
+func (r *Routes) applyPatchResponse(c *fiber.Ctx, resp *Response) (*Response, error) {
+	ctx, cancel := context.WithTimeout(c.Context(), ResolveTimeout)
+	defer cancel()
+	resolved, err := r.ordfs.resolvePatch(ctx, resp.Content, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := *resp
+	out.ContentType = resolved.ContentType
+	out.Content = resolved.Content
+	out.ContentLength = resolved.ContentLength
+	return &out, nil
+}
+
+func (r *Routes) patchHTTPError(c *fiber.Ctx, err error) error {
+	if errors.Is(err, errPatchTooDeep) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "patch chain too deep",
+		})
+	}
+	if errors.Is(err, errInvalidPatch) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid patch",
+		})
+	}
+	if errors.Is(err, ErrNotFound) {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "file not found",
+		})
+	}
+	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+		"error": err.Error(),
+	})
 }
 
 const maxDirectoryDepth = 8
@@ -161,15 +213,15 @@ func pickDefaultDirectoryKey(directory map[string]string) (key string, ok bool) 
 	return "", false
 }
 
-// handleDirectory handles ord-fs/json directory content with recursive traversal.
-// Subdirectory entries pointing to other ord-fs/json inscriptions are followed
-// automatically, allowing nested directory trees (e.g., /content/root/refs/api.md).
 func (r *Routes) handleDirectory(c *fiber.Ctx, resp *Response, pp *pointerPath, seq *int) error {
-	// Parse directory JSON
-	var directory map[string]string
-	if err := json.Unmarshal(resp.Content, &directory); err != nil {
+	directory, err := parseDirectory(resp.ContentType, resp.Content)
+	if err != nil {
+		msg := "invalid directory format"
+		if errors.Is(err, ErrInvalidDirectory) {
+			msg = "invalid directory manifest"
+		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "invalid directory format",
+			"error": msg,
 		})
 	}
 
@@ -234,12 +286,22 @@ func (r *Routes) resolveDirectoryPath(
 		return err // already an HTTP response
 	}
 
-	// If there are more path segments and this entry is a subdirectory, recurse
-	if len(remaining) > 0 && fileResp.ContentType == "ord-fs/json" {
-		var subdir map[string]string
-		if err := json.Unmarshal(fileResp.Content, &subdir); err != nil {
+	if isPatchType(fileResp.ContentType) {
+		fileResp, err = r.applyPatchResponse(c, fileResp)
+		if err != nil {
+			return r.patchHTTPError(c, err)
+		}
+	}
+
+	if len(remaining) > 0 && isDirectoryType(fileResp.ContentType) {
+		subdir, err := parseDirectory(fileResp.ContentType, fileResp.Content)
+		if err != nil {
+			msg := "invalid subdirectory format"
+			if errors.Is(err, ErrInvalidDirectory) {
+				msg = "invalid directory manifest"
+			}
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "invalid subdirectory format",
+				"error": msg,
 			})
 		}
 		return r.resolveDirectoryPath(c, fileResp, subdir, remaining, depth+1)
@@ -341,6 +403,7 @@ func (r *Routes) HandleMetadata(c *fiber.Ctx) error {
 	}
 	req.Content = false // Don't load content bytes
 	req.Map = true
+	req.Raw = c.Query("raw") != ""
 
 	metaCtx, metaCancel := context.WithTimeout(c.Context(), ResolveTimeout)
 	defer metaCancel()
@@ -590,6 +653,67 @@ func (r *Routes) HandleStream(c *fiber.Ctx) error {
 	}
 
 	return nil
+}
+
+// HandleBRC150 returns Outpoint BEEF (BRC-158) provenance for a 1-sat tip (BRC-150).
+// @Summary BRC-150 provenance (Outpoint BEEF)
+// @Description Binary Outpoint BEEF for the tip: path tip→origin plus each hop’s input source txs up to the ordinal carrier input. Headers: X-Origin, X-Content-Type (origin inscription MIME when known). No path header.
+// @Tags ordfs
+// @Produce application/octet-stream
+// @Param path path string true "Tip outpoint (txid_vout)"
+// @Success 200 {file} binary "Outpoint BEEF (BRC-158) bytes"
+// @Header 200 {string} X-Origin "Proven origin outpoint (txid_vout)"
+// @Header 200 {string} X-Content-Type "Origin inscription MIME (BRC-150 contentType), if known"
+// @Failure 400 {object} map[string]string "Bad request"
+// @Failure 404 {object} map[string]string "Not found"
+// @Router /brc150/{path} [get]
+func (r *Routes) HandleBRC150(c *fiber.Ctx) error {
+	path := c.Params("*")
+	if path == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "outpoint is required",
+		})
+	}
+
+	// Accept bare outpoint only (no :seq / filepath) — tip is the outpoint itself.
+	pp, err := parsePointerPath(path)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	if pp.Seq != nil || pp.FilePath != "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "brc150 requires a concrete tip outpoint (no :seq or filepath)",
+		})
+	}
+
+	outpoint, isTxid, err := resolvePointerToOutpoint(pp.Pointer)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	if isTxid {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "brc150 requires txid_vout outpoint, not bare txid",
+		})
+	}
+
+	provCtx, cancel := context.WithTimeout(c.Context(), ResolveTimeout)
+	defer cancel()
+	prov, err := r.ordfs.BuildProvenance(provCtx, outpoint)
+	if err != nil {
+		r.logger.Debug("brc150 provenance failed", "outpoint", outpoint.String(), "error", err)
+		if errors.Is(err, ErrNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	c.Set("Content-Type", "application/octet-stream")
+	c.Set("X-Origin", prov.Origin.String())
+	if prov.ContentType != "" {
+		c.Set("X-Content-Type", prov.ContentType)
+	}
+	httputil.SetNoStore(c)
+	return c.Send(prov.Beef)
 }
 
 // pointerPath represents a parsed pointer path with optional seq and file path

@@ -104,6 +104,10 @@ func (l *BSV21Lookup) OutputAdmittedByTopic(ctx context.Context, payload *engine
 
 	if b.Op == string(bsv21.OpDeployMint) || b.Op == string(bsv21.OpDeployAuth) {
 		b.Id = outpoint.OrdinalString()
+		if b.Icon != nil {
+			icon := parse.NormalizeRelativeOutpoint(*b.Icon, outpoint)
+			b.Icon = &icon
+		}
 	}
 
 	score := types.ScoreFromTx(tx, txid)
@@ -230,14 +234,20 @@ func (l *BSV21Lookup) ListTokens(ctx context.Context) ([]*TokenInfo, error) {
 			t.Decimals = &d
 		}
 		if icon.Valid {
-			t.Icon = &icon.String
+			iconStr := icon.String
+			if op, err := transaction.OutpointFromString(id); err == nil {
+				iconStr = parse.NormalizeRelativeOutpoint(iconStr, op)
+			}
+			t.Icon = &iconStr
 		}
 		tokens = append(tokens, t)
 	}
 	return tokens, rows.Err()
 }
 
-// CountOutputs returns the count of unspent outputs in a topic's token_outputs table.
+// CountOutputs returns the count of every output ever indexed into a topic's
+// token_outputs table. Fees are charged per output indexed and are not refunded
+// when an output is later spent, so spent outputs stay in the count.
 func (l *BSV21Lookup) CountOutputs(ctx context.Context, topic string) (int64, error) {
 	ts, err := l.db(topic)
 	if err != nil {
@@ -246,7 +256,7 @@ func (l *BSV21Lookup) CountOutputs(ctx context.Context, topic string) (int64, er
 
 	var count int64
 	err = ts.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM token_outputs WHERE spend_txid IS NULL`,
+		`SELECT COUNT(*) FROM token_outputs`,
 	).Scan(&count)
 	return count, err
 }
@@ -399,7 +409,8 @@ func (l *BSV21Lookup) GetToken(ctx context.Context, outpoint *transaction.Outpoi
 		token.Decimals = &d
 	}
 	if icon.Valid {
-		token.Icon = &icon.String
+		iconStr := parse.NormalizeRelativeOutpoint(icon.String, outpoint)
+		token.Icon = &iconStr
 	}
 
 	l.mintCache.Store(tokenId, token)
